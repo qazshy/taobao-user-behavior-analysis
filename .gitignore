@@ -1,0 +1,16 @@
+# 原始大数据，不纳入仓库（自行从天池下载）
+data/UserBehavior.csv
+data/*.csv
+
+# Python 缓存
+__pycache__/
+*.pyc
+.venv/
+
+# IDE
+.idea/
+.vscode/
+
+# 系统
+.DS_Store
+Thumbs.db
