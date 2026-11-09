@@ -35,6 +35,12 @@ select count(*) from ub_clean;
 ALTER TABLE ub_clean ADD INDEX idx_user (user_id);
 ALTER TABLE ub_clean ADD INDEX idx_dt (dt);
 
+SELECT dt,
+       COUNT(*) AS row_cnt,
+       COUNT(DISTINCT user_id) AS uv
+FROM ub_clean
+GROUP BY dt
+ORDER BY dt;
 
 -- 1、大盘指标：总PV、UV、收藏数、加购数、下单数
 SELECT
@@ -54,26 +60,50 @@ FROM ub_clean
 GROUP BY dt ORDER BY dt;
 
 -- 3、小时活跃度分布（看一天哪个点人多）
-SELECT hour, COUNT(DISTINCT user_id) AS hour_uv
-FROM ub_clean
-GROUP BY hour ORDER BY hour;
+WITH d AS (
+    SELECT dt, hour, COUNT(DISTINCT user_id) AS uv
+    FROM ub_clean
+    GROUP BY dt, hour
+)
+SELECT hour,
+       AVG(uv)    AS avg_uv,      -- 典型一天这个点的人数
+       MAX(uv)    AS max_uv,      -- 峰值
+       COUNT(*)   AS day_cnt      -- 有效天数，防止某小时只有几天有数据
+FROM d
+GROUP BY hour
+ORDER BY hour;
 
 -- 4、转化漏斗（核心）
-WITH t AS (
-    SELECT
-        COUNT(DISTINCT user_id) AS pv_uv,
-        COUNT(DISTINCT CASE WHEN behavior IN ('fav','cart') THEN user_id END) AS fav_cart_uv,
-        COUNT(DISTINCT CASE WHEN behavior='buy' THEN user_id END) AS buy_uv
-    FROM ub_clean
-)
-SELECT
-    pv_uv,
-    fav_cart_uv,
-    buy_uv,
-    ROUND(fav_cart_uv/pv_uv,4) AS pv_to_favcart_rate,
-    ROUND(buy_uv/fav_cart_uv,4) AS favcart_to_buy_rate,
-    ROUND(buy_uv/pv_uv,4) AS overall_conv_rate
-FROM t;
+WITH ub AS (
+    -- 一行一个用户：三个 0/1 标记，表示"是否发生过某类行为"
+    SELECT user_id,
+           MAX(CASE WHEN behavior = 'pv'            THEN 1 ELSE 0 END) AS has_pv,
+           MAX(CASE WHEN behavior IN ('fav','cart') THEN 1 ELSE 0 END) AS has_fc,
+           MAX(CASE WHEN behavior = 'buy'            THEN 1 ELSE 0 END) AS has_buy
+    FROM (SELECT DISTINCT user_id, behavior FROM ub_clean) c
+    GROUP BY user_id
+),
+     agg AS (
+         SELECT SUM(has_pv)                                                  AS pv_uv,
+                SUM(CASE WHEN has_pv = 1 AND has_buy = 1 THEN 1 ELSE 0 END)  AS buy_uv,
+                SUM(CASE WHEN has_pv = 1 AND has_fc  = 1 THEN 1 ELSE 0 END)  AS fc_uv,
+                SUM(CASE WHEN has_pv = 1 AND has_fc = 1 AND has_buy = 1
+                             THEN 1 ELSE 0 END)                                  AS fc_buy_uv,
+                SUM(CASE WHEN has_pv = 1 AND has_fc = 0 AND has_buy = 1
+                             THEN 1 ELSE 0 END)                                  AS direct_buy_uv
+         FROM ub
+     )
+SELECT pv_uv,
+       buy_uv,
+       ROUND(buy_uv * 100 / pv_uv, 2)        AS 浏览到下单_pct,
+       fc_uv,
+       ROUND(fc_uv * 100 / pv_uv, 2)         AS 收藏加购渗透率_pct,
+       fc_buy_uv,
+       ROUND(fc_buy_uv * 100 / fc_uv, 2)     AS 收藏加购到下单_pct,
+       direct_buy_uv,
+       ROUND(direct_buy_uv * 100 / pv_uv, 2) AS 直接下单_pct
+FROM agg;
+
 
 -- 5、类目浏览量&转化统计
 SELECT category_id,
@@ -123,18 +153,40 @@ SELECT dt, COUNT(DISTINCT user_id) AS dau, SUM(IF(behavior='pv',1,0)) AS daily_p
 FROM ub_clean GROUP BY dt ORDER BY dt;
 
 CREATE TABLE rpt_hourly AS
-SELECT hour, COUNT(DISTINCT user_id) AS hour_uv
-FROM ub_clean GROUP BY hour ORDER BY hour;
+WITH d AS (
+    SELECT dt, hour, COUNT(DISTINCT user_id) AS uv
+    FROM ub_clean
+    GROUP BY dt, hour
+)
+SELECT hour,
+       AVG(uv)    AS avg_uv,      -- 典型一天这个点的人数
+       MAX(uv)    AS max_uv,      -- 峰值
+       COUNT(*)   AS day_cnt      -- 有效天数，防止某小时只有几天有数据
+FROM d
+GROUP BY hour
+ORDER BY hour;
 
 CREATE TABLE rpt_funnel AS
-SELECT '浏览' AS stage, COUNT(DISTINCT CASE WHEN behavior='pv' THEN user_id END) AS uv
-from ub_clean
+WITH ub AS (
+    SELECT user_id,
+           MAX(CASE WHEN behavior = 'pv'            THEN 1 ELSE 0 END) AS has_pv,
+           MAX(CASE WHEN behavior IN ('fav','cart') THEN 1 ELSE 0 END) AS has_fc,
+           MAX(CASE WHEN behavior = 'buy'            THEN 1 ELSE 0 END) AS has_buy
+    FROM (SELECT DISTINCT user_id, behavior FROM ub_clean) c
+    GROUP BY user_id
+)
+SELECT 1 AS stage_order, '浏览' AS stage,
+       SUM(has_pv) AS uv
+FROM ub
 UNION ALL
-SELECT '收藏加购', COUNT(DISTINCT CASE WHEN behavior IN ('fav','cart') THEN user_id END)
-FROM ub_clean
+SELECT 2, '收藏/加购',
+       SUM(CASE WHEN has_pv = 1 AND has_fc = 1 THEN 1 ELSE 0 END)
+FROM ub
 UNION ALL
-SELECT '下单', COUNT(DISTINCT CASE WHEN behavior='buy' THEN user_id END)
-FROM ub_clean;
+SELECT 3, '下单',
+       SUM(CASE WHEN has_pv = 1 AND has_buy = 1 THEN 1 ELSE 0 END)
+FROM ub
+ORDER BY stage_order;
 
 -- The total number of locks exceeds the lock table size，rpt_cohort建表超过缓冲区大小，可以直接用查询结果导出csv
 CREATE TABLE rpt_cohort AS
